@@ -72,7 +72,77 @@ All three models were evaluated on a held-out validation set, with the champion 
 
 The feature importance plots from the champion model pointed to engagement-rate features — particularly `km_per_driving_day`, `percent_sessions_in_last_month`, and `total_sessions_per_day` — as the strongest predictors of churn.
 
+## Summary of Findings
+
+This project unfolded across multiple milestones in the certificate program, each building on the last. Here's a consolidated look at what the most important stages revealed and how the findings evolved.
+
 ---
+
+### Milestone 4 — Two-Sample Hypothesis Test
+
+The first major analytical question was: **does device type actually affect how much users drive?**
+
+iPhone users averaged 68 drives compared to 66 for Android users — a small raw difference. But after running a **Welch's two-sample t-test** (which doesn't assume equal variance between groups, a safer choice here), the result was clear: **the difference is not statistically significant** at the α = 0.05 level.
+
+What does that mean in practice? Device type alone can't explain churn behavior. A user's platform isn't predictive — so any retention strategy that tried to target iPhone or Android users differently, based on this variable alone, wouldn't be grounded in data.
+
+The recommendation from this milestone was to run additional t-tests on other behavioral variables to build a fuller picture. It was a good reminder that a non-significant result is still a finding — it rules things out and points us toward where to look next.
+
+---
+
+### Milestone 5 — Binomial Logistic Regression
+
+With hypothesis testing done, the next step was building an actual predictive model. I started with **binomial logistic regression** — a natural first choice for binary classification (churned vs. retained) because it's interpretable and establishes a performance baseline.
+
+The results were honest about the model's limitations:
+
+- **Precision: 53%** — just over half of predicted churners actually churned
+- **Recall: 9%** — the model only identified about 1 in 11 actual churners
+
+That recall score is rough. The confusion matrix showed a large number of false negatives — users who churned but were classified as retained. For a business trying to proactively intervene, missing 91% of churners is a serious problem.
+
+Still, the model surfaced something genuinely useful: **`activity_days` was by far the most important feature**, with a *negative* correlation with churn (more active days = lower churn risk). This makes intuitive sense and gave us a strong signal to carry into more complex models. Interestingly, `km_per_driving_day` showed a *positive* correlation with churn — users who drive farther on the days they do use the app are actually *more* likely to churn, which is a counterintuitive finding worth investigating further.
+
+The conclusion from this milestone: logistic regression isn't powerful enough to rely on here, but it validated the feature engineering approach and confirmed that **more data — especially drive-level granular data like timestamps, geographic locations, and route types — would meaningfully improve any future model**.
+
+---
+
+### Milestone 6 — Random Forest & XGBoost (Champion Model)
+
+This was the main event. I built two tree-based ensemble models and compared them against each other (and implicitly against the logistic regression baseline).
+
+**Key results:**
+
+- **XGBoost outperformed Random Forest** across all evaluation metrics and fit the data better overall
+- The XGBoost model's **recall score of ~17%** was nearly double that of the logistic regression model — still modest in absolute terms, but a meaningful improvement given the same dataset
+- Accuracy and precision remained comparable to the logistic regression model, so the gain in recall didn't come at a dramatic cost elsewhere
+
+**What the feature importance chart revealed:**
+
+The top predictors of churn — by a significant margin — were the engineered features, not the raw dataset columns:
+
+| Rank | Feature | Type |
+|---|---|---|
+| 1 | `km_per_hour` | Engineered |
+| 2 | `n_days_after_onboarding` | Raw |
+| 3 | `percent_sessions_in_last_month` | Engineered |
+| 4 | `total_sessions_per_day` | Engineered |
+| 5 | `duration_minutes_drives` | Raw |
+| 6 | `percent_of_drives_to_favorite` | Engineered |
+
+**The bigger picture from Milestone 6:**
+
+Even with the best models I could build, the results confirm what the logistic regression already hinted at: **the current dataset is not sufficient to reliably predict churn**. The models demonstrate that the *right kind* of data matters — specifically, the team would benefit from drive-level data (individual trip timestamps, geographic coordinates, route types), more granular session data, and ideally a longer observation window per user.
+
+The recommendation from this milestone was a second iteration of the project with richer data collection in place. The ensemble models are more valuable than a single logistic regression, but they're not a production-ready solution yet — they're a proof of concept that shows what's possible with better inputs.
+
+---
+
+### Overall Project Takeaway
+
+Across all three milestones, the consistent theme was this: **the data we have tells a partial story, but not enough of one to act on confidently**. The hypothesis test ruled out device type. The logistic regression flagged activity days and drive distance as meaningful signals. The ensemble models confirmed those signals and squeezed more predictive power out of them — but the ceiling is limited by what the dataset actually captures.
+
+If this were a real project, the next step wouldn't be a fancier algorithm — it would be better data collection. And honestly, learning to say that clearly and back it up with evidence feels like one of the most important skills this certificate has helped me build.
 
 ## What I Learned
 

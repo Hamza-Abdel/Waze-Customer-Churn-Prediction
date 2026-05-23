@@ -1,0 +1,671 @@
+# Note: I used Claude to aid in making this code clearer and provide better explanation/comments for it.
+
+"""
+Waze User Churn Prediction - Complete ML Pipeline
+===================================================
+This script performs end-to-end data analysis, feature engineering, and machine learning
+modeling to predict user churn for the Waze navigation application.
+
+Pipeline stages:
+1. Data loading and cleaning
+2. Feature engineering
+3. Exploratory data analysis
+4. Model building (Random Forest & XGBoost)
+5. Model evaluation and comparison
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle
+from scipy import stats
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.metrics import (
+    confusion_matrix, ConfusionMatrixDisplay,
+    classification_report, accuracy_score, precision_score,
+    recall_score, f1_score, roc_auc_score, roc_curve, auc,
+    RocCurveDisplay, PrecisionRecallDisplay
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier, plot_importance
+
+pd.set_option('display.max_columns', None)
+sns.set_style("whitegrid")
+
+
+# ============================================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================================
+
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+VAL_SIZE = 0.25
+STRATIFY_COLS = ['label']
+DATA_FILE = 'waze_dataset.csv'
+
+
+# ============================================================================
+# DATA LOADING & INITIAL INSPECTION
+# ============================================================================
+
+def load_data(filepath: str) -> pd.DataFrame:
+    """Load dataset from CSV file."""
+    df = pd.read_csv(filepath)
+    print(f"Dataset shape: {df.shape}")
+    print(f"\nFirst few rows:\n{df.head()}")
+    print(f"\nData types:\n{df.dtypes}")
+    return df
+
+
+def inspect_missing_data(df: pd.DataFrame) -> None:
+    """Identify and report missing values."""
+    print("\n" + "="*60)
+    print("MISSING VALUES ANALYSIS")
+    print("="*60)
+    missing_count = df.isnull().sum()
+    missing_pct = (missing_count / len(df)) * 100
+    missing_df = pd.DataFrame({
+        'Missing_Count': missing_count,
+        'Percentage': missing_pct
+    })
+    print(missing_df[missing_df['Missing_Count'] > 0])
+
+
+def inspect_outliers(df: pd.DataFrame, numeric_cols: list) -> None:
+    """Visualize outliers using boxplots."""
+    print("\n" + "="*60)
+    print("OUTLIER DETECTION")
+    print("="*60)
+    for col in numeric_cols[:3]:
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        outlier_count = len(df[(df[col] < lower_bound) | (df[col] > upper_bound)])
+        print(f"{col}: {outlier_count} outliers detected")
+
+
+# ============================================================================
+# DATA CLEANING
+# ============================================================================
+
+def drop_missing_labels(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove rows with missing label values (< 5% of data)."""
+    initial_len = len(df)
+    df = df.dropna(subset=['label'])
+    dropped = initial_len - len(df)
+    print(f"\nDropped {dropped} rows with missing labels ({dropped/initial_len*100:.2f}%)")
+    return df
+
+
+def impute_outliers(df: pd.DataFrame, columns: list, percentile: float = 0.95) -> pd.DataFrame:
+    """Replace outlier values with percentile threshold."""
+    print(f"\nImputing outliers (>{percentile*100}th percentile)...")
+    for col in columns:
+        threshold = df[col].quantile(percentile)
+        outlier_count = len(df[df[col] > threshold])
+        df.loc[df[col] > threshold, col] = threshold
+        print(f"  {col}: {outlier_count} values imputed")
+    return df
+
+
+# ============================================================================
+# FEATURE ENGINEERING
+# ============================================================================
+
+def create_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Engineer new features from existing columns."""
+    print("\n" + "="*60)
+    print("FEATURE ENGINEERING")
+    print("="*60)
+
+    # km_per_driving_day: mean kilometers per driving day
+    df['km_per_driving_day'] = df['driven_km_drives'] / df['driving_days']
+    df.loc[df['km_per_driving_day'] == np.inf, 'km_per_driving_day'] = 0
+    print("✓ Created: km_per_driving_day")
+
+    # percent_sessions_in_last_month: % of total sessions in last month
+    df['percent_sessions_in_last_month'] = df['sessions'] / df['total_sessions']
+    print("✓ Created: percent_sessions_in_last_month")
+
+    # professional_driver: binary indicator (60+ drives AND 15+ driving days)
+    df['professional_driver'] = np.where(
+        (df['drives'] >= 60) & (df['driving_days'] >= 15), 1, 0
+    )
+    print("✓ Created: professional_driver")
+
+    # total_sessions_per_day: mean sessions per day since onboarding
+    df['total_sessions_per_day'] = df['total_sessions'] / df['n_days_after_onboarding']
+    print("✓ Created: total_sessions_per_day")
+
+    # km_per_hour: mean kilometers per hour driven
+    df['km_per_hour'] = df['driven_km_drives'] / (df['duration_minutes_drives'] / 60)
+    print("✓ Created: km_per_hour")
+
+    # km_per_drive: mean kilometers per drive
+    df['km_per_drive'] = df['driven_km_drives'] / df['drives']
+    df.loc[df['km_per_drive'] == np.inf, 'km_per_drive'] = 0
+    print("✓ Created: km_per_drive")
+
+    # percent_of_drives_to_favorite: % of navigations to favorite places
+    df['percent_of_drives_to_favorite'] = (
+        (df['total_navigations_fav1'] + df['total_navigations_fav2']) /
+        df['total_sessions']
+    )
+    print("✓ Created: percent_of_drives_to_favorite")
+
+    return df
+
+
+def encode_categorical(df: pd.DataFrame) -> pd.DataFrame:
+    """Encode categorical variables to numeric."""
+    print("\n" + "="*60)
+    print("CATEGORICAL ENCODING")
+    print("="*60)
+
+    # Encode device (Android=0, iPhone=1)
+    df['device2'] = np.where(df['device'] == 'Android', 0, 1)
+    print("✓ Encoded device → device2")
+
+    # Encode label (retained=0, churned=1)
+    df['label2'] = np.where(df['label'] == 'churned', 1, 0)
+    print("✓ Encoded label → label2")
+
+    return df
+
+
+# ============================================================================
+# EXPLORATORY DATA ANALYSIS
+# ============================================================================
+
+def analyze_class_balance(df: pd.DataFrame) -> None:
+    """Analyze target variable class distribution."""
+    print("\n" + "="*60)
+    print("CLASS BALANCE ANALYSIS")
+    print("="*60)
+    class_dist = df['label'].value_counts(normalize=True)
+    print(class_dist)
+    print(f"\nClass imbalance ratio: {class_dist.iloc[1]/class_dist.iloc[0]:.3f}")
+
+
+def compare_features_by_churn(df: pd.DataFrame) -> None:
+    """Compare median feature values between churned and retained users."""
+    print("\n" + "="*60)
+    print("FEATURE COMPARISON: CHURNED vs RETAINED")
+    print("="*60)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    comparison = df.groupby('label')[numeric_cols].median()
+    print(comparison)
+
+
+def analyze_correlation(df: pd.DataFrame) -> pd.DataFrame:
+    """Generate correlation matrix and identify high correlations."""
+    print("\n" + "="*60)
+    print("CORRELATION ANALYSIS")
+    print("="*60)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    corr_matrix = df[numeric_cols].corr()
+    
+    high_corr = []
+    for i in range(len(corr_matrix.columns)):
+        for j in range(i+1, len(corr_matrix.columns)):
+            if abs(corr_matrix.iloc[i, j]) > 0.8:
+                high_corr.append({
+                    'Feature1': corr_matrix.columns[i],
+                    'Feature2': corr_matrix.columns[j],
+                    'Correlation': corr_matrix.iloc[i, j]
+                })
+    
+    if high_corr:
+        print("\nHigh correlations (|r| > 0.8):")
+        for pair in high_corr:
+            print(f"  {pair['Feature1']} <-> {pair['Feature2']}: {pair['Correlation']:.3f}")
+    
+    return corr_matrix
+
+
+def plot_correlation_heatmap(corr_matrix: pd.DataFrame, figsize: tuple = (14, 10)) -> None:
+    """Create correlation heatmap visualization."""
+    plt.figure(figsize=figsize)
+    sns.heatmap(corr_matrix, cmap='coolwarm', center=0, annot=False, square=True)
+    plt.title('Feature Correlation Matrix')
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================================
+# HYPOTHESIS TESTING
+# ============================================================================
+
+def hypothesis_test_device_churn(df: pd.DataFrame) -> None:
+    """Conduct t-test for mean drives by device type."""
+    print("\n" + "="*60)
+    print("HYPOTHESIS TEST: DEVICE TYPE & CHURN")
+    print("="*60)
+
+    # Map device to numeric
+    df['device_numeric'] = np.where(df['device'] == 'iPhone', 1, 0)
+
+    # Get mean drives by device
+    iphone_drives = df[df['device_numeric'] == 1]['drives']
+    android_drives = df[df['device_numeric'] == 0]['drives']
+
+    print(f"iPhone mean drives: {iphone_drives.mean():.2f}")
+    print(f"Android mean drives: {android_drives.mean():.2f}")
+
+    # Conduct t-test
+    t_stat, p_value = stats.ttest_ind(iphone_drives, android_drives, equal_var=False)
+    print(f"\nWelch's t-test:")
+    print(f"  t-statistic: {t_stat:.4f}")
+    print(f"  p-value: {p_value:.4f}")
+
+    if p_value > 0.05:
+        print("  Result: No significant difference (α=0.05)")
+    else:
+        print("  Result: Significant difference (α=0.05)")
+
+
+# ============================================================================
+# LOGISTIC REGRESSION MODEL
+# ============================================================================
+
+def build_logistic_regression(X_train: pd.DataFrame, X_val: pd.DataFrame,
+                             y_train: pd.Series, y_val: pd.Series) -> dict:
+    """Build and evaluate logistic regression model."""
+    print("\n" + "="*60)
+    print("LOGISTIC REGRESSION MODEL")
+    print("="*60)
+
+    # Fit model
+    lr_model = LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)
+    lr_model.fit(X_train, y_train)
+
+    # Predict
+    y_pred_train = lr_model.predict(X_train)
+    y_pred_val = lr_model.predict(X_val)
+
+    # Evaluate
+    train_acc = accuracy_score(y_train, y_pred_train)
+    val_acc = accuracy_score(y_val, y_pred_val)
+    val_recall = recall_score(y_val, y_pred_val)
+    val_precision = precision_score(y_val, y_pred_val)
+    val_f1 = f1_score(y_val, y_pred_val)
+
+    print(f"Train Accuracy: {train_acc:.4f}")
+    print(f"Val Accuracy: {val_acc:.4f}")
+    print(f"Val Recall: {val_recall:.4f}")
+    print(f"Val Precision: {val_precision:.4f}")
+    print(f"Val F1: {val_f1:.4f}")
+
+    return {
+        'model': lr_model,
+        'metrics': {
+            'accuracy': val_acc,
+            'precision': val_precision,
+            'recall': val_recall,
+            'f1': val_f1
+        }
+    }
+
+
+# ============================================================================
+# RANDOM FOREST MODEL
+# ============================================================================
+
+def build_random_forest(X_train: pd.DataFrame, X_val: pd.DataFrame,
+                        y_train: pd.Series, y_val: pd.Series) -> dict:
+    """Build and evaluate Random Forest model with hyperparameter tuning."""
+    print("\n" + "="*60)
+    print("RANDOM FOREST MODEL")
+    print("="*60)
+
+    rf = RandomForestClassifier(random_state=RANDOM_STATE)
+
+    cv_params = {
+        'max_depth': [10, 20, None],
+        'max_features': [0.5, 1.0],
+        'min_samples_leaf': [2, 5],
+        'n_estimators': [100, 300]
+    }
+
+    rf_cv = GridSearchCV(
+        rf, cv_params,
+        scoring=['accuracy', 'precision', 'recall', 'f1'],
+        cv=4, refit='recall', n_jobs=-1, verbose=1
+    )
+
+    print("Tuning hyperparameters (GridSearchCV)...")
+    rf_cv.fit(X_train, y_train)
+
+    print(f"\nBest parameters: {rf_cv.best_params_}")
+    print(f"Best cross-val recall: {rf_cv.best_score_:.4f}")
+
+    # Evaluate on validation set
+    y_pred_val = rf_cv.predict(X_val)
+    val_acc = accuracy_score(y_val, y_pred_val)
+    val_recall = recall_score(y_val, y_pred_val)
+    val_precision = precision_score(y_val, y_pred_val)
+    val_f1 = f1_score(y_val, y_pred_val)
+
+    print(f"\nValidation Set Performance:")
+    print(f"  Accuracy: {val_acc:.4f}")
+    print(f"  Precision: {val_precision:.4f}")
+    print(f"  Recall: {val_recall:.4f}")
+    print(f"  F1: {val_f1:.4f}")
+
+    return {
+        'model': rf_cv,
+        'best_model': rf_cv.best_estimator_,
+        'metrics': {
+            'accuracy': val_acc,
+            'precision': val_precision,
+            'recall': val_recall,
+            'f1': val_f1
+        }
+    }
+
+
+# ============================================================================
+# XGBOOST MODEL
+# ============================================================================
+
+def build_xgboost(X_train: pd.DataFrame, X_val: pd.DataFrame,
+                  y_train: pd.Series, y_val: pd.Series) -> dict:
+    """Build and evaluate XGBoost model with hyperparameter tuning."""
+    print("\n" + "="*60)
+    print("XGBOOST MODEL")
+    print("="*60)
+
+    xgb = XGBClassifier(objective='binary:logistic', random_state=RANDOM_STATE, verbosity=0)
+
+    cv_params = {
+        'max_depth': [6, 12],
+        'min_child_weight': [3, 5],
+        'learning_rate': [0.01, 0.1],
+        'n_estimators': [300]
+    }
+
+    xgb_cv = GridSearchCV(
+        xgb, cv_params,
+        scoring=['accuracy', 'precision', 'recall', 'f1'],
+        cv=4, refit='recall', n_jobs=-1, verbose=1
+    )
+
+    print("Tuning hyperparameters (GridSearchCV)...")
+    xgb_cv.fit(X_train, y_train)
+
+    print(f"\nBest parameters: {xgb_cv.best_params_}")
+    print(f"Best cross-val recall: {xgb_cv.best_score_:.4f}")
+
+    # Evaluate on validation set
+    y_pred_val = xgb_cv.predict(X_val)
+    val_acc = accuracy_score(y_val, y_pred_val)
+    val_recall = recall_score(y_val, y_pred_val)
+    val_precision = precision_score(y_val, y_pred_val)
+    val_f1 = f1_score(y_val, y_pred_val)
+
+    print(f"\nValidation Set Performance:")
+    print(f"  Accuracy: {val_acc:.4f}")
+    print(f"  Precision: {val_precision:.4f}")
+    print(f"  Recall: {val_recall:.4f}")
+    print(f"  F1: {val_f1:.4f}")
+
+    return {
+        'model': xgb_cv,
+        'best_model': xgb_cv.best_estimator_,
+        'metrics': {
+            'accuracy': val_acc,
+            'precision': val_precision,
+            'recall': val_recall,
+            'f1': val_f1
+        }
+    }
+
+
+# ============================================================================
+# MODEL EVALUATION & COMPARISON
+# ============================================================================
+
+def make_results_table(model_name: str, model_object, metric: str) -> pd.DataFrame:
+    """Extract CV results from GridSearchCV object."""
+    metric_dict = {
+        'precision': 'mean_test_precision',
+        'recall': 'mean_test_recall',
+        'f1': 'mean_test_f1',
+        'accuracy': 'mean_test_accuracy'
+    }
+
+    cv_results = pd.DataFrame(model_object.cv_results_)
+    best_idx = cv_results[metric_dict[metric]].idxmax()
+    best_row = cv_results.iloc[best_idx]
+
+    table = pd.DataFrame({
+        'model': [model_name],
+        'accuracy': [best_row.mean_test_accuracy],
+        'precision': [best_row.mean_test_precision],
+        'recall': [best_row.mean_test_recall],
+        'f1': [best_row.mean_test_f1]
+    })
+
+    return table
+
+
+def compare_models(lr_results: dict, rf_results: dict, xgb_results: dict) -> pd.DataFrame:
+    """Compare all models on validation set."""
+    print("\n" + "="*60)
+    print("MODEL COMPARISON")
+    print("="*60)
+
+    comparison = pd.DataFrame({
+        'Model': ['Logistic Regression', 'Random Forest', 'XGBoost'],
+        'Accuracy': [
+            lr_results['metrics']['accuracy'],
+            rf_results['metrics']['accuracy'],
+            xgb_results['metrics']['accuracy']
+        ],
+        'Precision': [
+            lr_results['metrics']['precision'],
+            rf_results['metrics']['precision'],
+            xgb_results['metrics']['precision']
+        ],
+        'Recall': [
+            lr_results['metrics']['recall'],
+            rf_results['metrics']['recall'],
+            xgb_results['metrics']['recall']
+        ],
+        'F1': [
+            lr_results['metrics']['f1'],
+            rf_results['metrics']['f1'],
+            xgb_results['metrics']['f1']
+        ]
+    })
+
+    print(comparison.to_string(index=False))
+    return comparison
+
+
+def evaluate_champion(champion: dict, X_test: pd.DataFrame,
+                     y_test: pd.Series, name: str) -> None:
+    """Evaluate champion model on test set."""
+    print("\n" + "="*60)
+    print(f"FINAL EVALUATION: {name}")
+    print("="*60)
+
+    model = champion['model']
+    y_pred = model.predict(X_test)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
+
+    test_acc = accuracy_score(y_test, y_pred)
+    test_precision = precision_score(y_test, y_pred)
+    test_recall = recall_score(y_test, y_pred)
+    test_f1 = f1_score(y_test, y_pred)
+    test_auc = roc_auc_score(y_test, y_pred_proba)
+
+    print(f"Test Accuracy: {test_acc:.4f}")
+    print(f"Test Precision: {test_precision:.4f}")
+    print(f"Test Recall: {test_recall:.4f}")
+    print(f"Test F1: {test_f1:.4f}")
+    print(f"Test AUC-ROC: {test_auc:.4f}")
+
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(y_test, y_pred)
+    print(cm)
+
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred, target_names=['Retained', 'Churned']))
+
+    return {
+        'accuracy': test_acc,
+        'precision': test_precision,
+        'recall': test_recall,
+        'f1': test_f1,
+        'auc': test_auc
+    }
+
+
+def plot_model_comparison(comparison: pd.DataFrame) -> None:
+    """Visualize model comparison."""
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    metrics = ['Accuracy', 'Precision', 'Recall', 'F1']
+
+    for idx, metric in enumerate(metrics):
+        axes[idx].bar(comparison['Model'], comparison[metric])
+        axes[idx].set_title(metric)
+        axes[idx].set_ylabel('Score')
+        axes[idx].set_ylim(0, 1)
+        axes[idx].tick_params(axis='x', rotation=45)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_feature_importance(model, feature_names: list, top_n: int = 15) -> None:
+    """Plot feature importance for tree-based models."""
+    if hasattr(model, 'feature_importances_'):
+        importances = model.feature_importances_
+        indices = np.argsort(importances)[-top_n:]
+
+        plt.figure(figsize=(10, 6))
+        plt.barh(range(len(indices)), importances[indices])
+        plt.yticks(range(len(indices)), [feature_names[i] for i in indices])
+        plt.xlabel('Feature Importance')
+        plt.title('Top Feature Importances')
+        plt.tight_layout()
+        plt.show()
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Execute complete ML pipeline."""
+    print("\n" + "="*70)
+    print("WAZE USER CHURN PREDICTION - COMPLETE ML PIPELINE")
+    print("="*70)
+
+    # ---- Data Loading & Cleaning ----
+    df = load_data(DATA_FILE)
+    inspect_missing_data(df)
+    
+    df = drop_missing_labels(df)
+    
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    inspect_outliers(df, numeric_cols)
+    
+    outlier_cols = [
+        'sessions', 'drives', 'total_sessions',
+        'total_navigations_fav1', 'total_navigations_fav2',
+        'driven_km_drives', 'duration_minutes_drives'
+    ]
+    df = impute_outliers(df, outlier_cols, percentile=0.95)
+
+    # ---- Feature Engineering ----
+    df = create_features(df)
+    df = encode_categorical(df)
+
+    # ---- EDA ----
+    analyze_class_balance(df)
+    compare_features_by_churn(df)
+    corr_matrix = analyze_correlation(df)
+    plot_correlation_heatmap(corr_matrix)
+
+    # ---- Hypothesis Testing ----
+    hypothesis_test_device_churn(df)
+
+    # ---- Data Splitting ----
+    X = df.drop(columns=['label', 'label2', 'device', 'device_numeric'])
+    y = df['label2']
+
+    X_tr, X_test, y_tr, y_test = train_test_split(
+        X, y, stratify=y, test_size=TEST_SIZE, random_state=RANDOM_STATE
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_tr, y_tr, stratify=y_tr, test_size=VAL_SIZE, random_state=RANDOM_STATE
+    )
+
+    print(f"\nData split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
+
+    # ---- Model Building ----
+    lr_results = build_logistic_regression(X_train, X_val, y_train, y_val)
+    rf_results = build_random_forest(X_train, X_val, y_train, y_val)
+    xgb_results = build_xgboost(X_train, X_val, y_train, y_val)
+
+    # ---- Model Comparison ----
+    comparison = compare_models(lr_results, rf_results, xgb_results)
+    plot_model_comparison(comparison)
+
+    # ---- Champion Model Selection & Final Evaluation ----
+    # Select model with highest recall on validation set
+    best_model_idx = comparison['Recall'].idxmax()
+    model_names = ['Logistic Regression', 'Random Forest', 'XGBoost']
+    champion_name = model_names[best_model_idx]
+
+    if champion_name == 'Random Forest':
+        champion = rf_results
+    elif champion_name == 'XGBoost':
+        champion = xgb_results
+    else:
+        champion = lr_results
+
+    test_results = evaluate_champion(champion, X_test, y_test, champion_name)
+
+    # ---- Feature Importance ----
+    if hasattr(champion['best_model'], 'feature_importances_'):
+        plot_feature_importance(champion['best_model'], X.columns.tolist())
+
+    # ---- Save Champion Model ----
+    with open(f'champion_model_{champion_name.replace(" ", "_")}.pkl', 'wb') as f:
+        pickle.dump(champion['best_model'], f)
+    print(f"\n✓ Champion model saved: {champion_name}")
+
+    print("\n" + "="*70)
+    print("PIPELINE COMPLETE")
+    print("="*70)
+
+    return {
+        'data': df,
+        'models': {
+            'logistic_regression': lr_results,
+            'random_forest': rf_results,
+            'xgboost': xgb_results
+        },
+        'comparison': comparison,
+        'champion': champion,
+        'test_results': test_results,
+        'X_train': X_train,
+        'X_val': X_val,
+        'X_test': X_test,
+        'y_train': y_train,
+        'y_val': y_val,
+        'y_test': y_test
+    }
+
+
+if __name__ == '__main__':
+    results = main()
